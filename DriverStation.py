@@ -39,6 +39,11 @@
 # * Add dtoverlay=uart3
 # * Reboot
 
+# Connecting the Raspberry Pi to the RadioMaster Ranger Micro:
+# * Pi Pin 7 (GPIO 4 / UART3 TX) -> Ranger JR Pin 1 (CRSF RX)
+# * Pi Pin 6 (GND) -> Ranger JR Pin 4 (GND)
+# * Pi Pin 29 (GPIO 5 / UART3 RX) -> Ranger JR Pin 5 (CRSF TX)
+
 from enum import Enum
 from numpy import interp
 import pygame
