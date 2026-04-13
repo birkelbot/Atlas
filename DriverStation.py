@@ -2,6 +2,43 @@
 
 # This program was built on Python 3.8.1.
 
+################################################################################
+# TODO: CODE NEEDS REVIEW
+# 
+# SUMMARY OF RECENT CHANGES (CRSF REFACTOR):
+#
+# - Transitioned serial output to use the CRSF protocol (24-byte packet, 420k baud).
+#   WHY: Required to communicate directly with the RadioMaster Ranger Micro TX module 
+#        over the JR bay connector using its native Crossfire format, replacing the
+#        old custom serial Xbee architecture.
+#
+# - Serial port changed to '/dev/ttyAMA1' (default UART3 on Pi 4). 
+#   WHY: The Pi 4 maps UART3 to Pins 7 & 29, which corresponds directly to the 
+#        Ranger's TX/RX requirements.
+#
+# - Arcade drive logic (CH1, CH2) rescaled to output natively between 172 and 1811 (neutral 992).
+#   WHY: The new ER5C-i receiver utilizes standard 11-bit CRSF channel data (172-1811) 
+#        instead of the old 8-bit (0-254) integer logic used by the custom Arduino build.
+#
+# - Weapon Drum output (CH3) added and mapped to Right Bumper to toggle between 172 and 1811.
+#   WHY: Atlas is equipped with a spinning drum that was not present on the old lifter. 
+#        Mapping it to a bumper allows seamlessly toggling max power without moving 
+#        thumbs off the primary drive sticks.
+#
+# - Arm Servo output (CH4) changed to slew target position up/down based on Analog Trigger pull.
+#   WHY: Because CH4 drives a positional A20CLS servo instead of a direct-drive DC motor, 
+#        sending pure analog trigger values would cause the servo to snap immediately to 
+#        discrete angles. Integrating the trigger values into a persistent "slew" target 
+#        creates a smooth, controllable arm sweep.
+#
+# - PyGame UI updated to explicitly represent these changes visually to the user.
+################################################################################
+
+# NEED TO ENABLE UART3 IN THE RASPBERRY PI CONFIG:
+# * nano /boot/firmware/config.txt
+# * Add dtoverlay=uart3
+# * Reboot
+
 from enum import Enum
 from numpy import interp
 import pygame
@@ -14,8 +51,9 @@ import math
 
 # To check what serial ports are available in Linux, use the bash command: dmesg | grep tty
 # To check what serial ports are available in Windows, go to Device Manager > Ports (COM & LPT)
-comPort = '/dev/ttyUSB0'
-ser = serial.Serial(comPort, 57600, timeout=1)
+# For Raspberry Pi 4 using UART3, the port is typically /dev/ttyAMA1
+comPort = '/dev/ttyAMA1'
+ser = serial.Serial(comPort, 420000, timeout=1)
 
 ### CONTROL SCHEME ###
 # Drive:
@@ -24,8 +62,11 @@ ser = serial.Serial(comPort, 57600, timeout=1)
 #     Right joystick X-axis -- turn/arc
 #
 # Arm:
-#   Right trigger -- arm up (analog control)
-#   Left trigger -- arm down (analog control)
+#   Right trigger -- arm pos target up (+ velocity)
+#   Left trigger -- arm pos target down (- velocity)
+# 
+# Weapon:
+#   Right Bumper -- Toggle Weapon on/off
 #######################
 
 # Set the channel numbers for various controls
@@ -36,9 +77,7 @@ ARM_USE_DUAL_ANALOG_INPUT = True  # Set to True/False for using single or dual a
 AXIS_ID_ARM_UP =  4   # For computers that use separate channels for the analog triggers
 AXIS_ID_ARM_DOWN =  5 # For computers that use separate channels for the analog triggers
 BUTTON_ID_STOP_PROGRAM = 1
-BUTTON_ID_ARM_TURBO = 0  # "A" button
-BUTTON_ID_ARM_DOWN_SLOW = 6  # Left bumper
-BUTTON_ID_ARM_UP_SLOW = 7  # Right bumper
+BUTTON_ID_WEAPON_TOGGLE = 7  # Right bumper to toggle weapon drum
 
 
 ############################################################
@@ -80,35 +119,40 @@ class DriverStationScreen:
         self.textPrint = TextPrint(screen)
 
     ############################################################
-    ## @brief Display joystick inputs and motor commands
+    ## @brief Display joystick inputs and subsystem commands
     ## @param yRaw - the raw joystick input for the Y-translation of the robot
     ## @param rRaw - the raw joystick input for the rotation of the robot
-    ## @param armRaw - the raw joystick input for the arm
-    ## @param lMtrCmd - the computed left motor command
-    ## @param rMtrCmd - the computed right motor command
-    ## @param armCmd - the computed arm command
+    ## @param armTrigs - the raw joystick trigger input for the arm shifting
+    ## @param ch1 - Left drive command
+    ## @param ch2 - Right drive command
+    ## @param ch3 - Weapon drum command
+    ## @param armTargetPos - the computed arm command
     ## @param packetsSent - the total number of packets sent so far to the robot
     ############################################################
-    def updateDisplay(self, yRaw, rRaw, armRaw, lMtrCmd, rMtrCmd, armCmd, packetsSent):
+    def updateDisplay(self, yRaw, rRaw, armTrigs, ch1, ch2, ch3, armTargetPos, packetsSent):
         self.textPrint.reset()
 
-        self.textPrint.disp("KEEP THIS WINDOW ACTIVE TO CONTINUE")
-        self.textPrint.disp("SENDING COMMANDS TO THE ROBOT")
+        self.textPrint.disp("ATLAS DRIVER STATION")
+        self.textPrint.disp("SENDING CRSF PACKETS TO ROBOT")
         self.textPrint.disp("")  # Intentional blank line
 
         self.textPrint.disp("Raw Joystick Inputs (-1.0 <-> 1.0)")
         self.textPrint.indent()
-        self.textPrint.disp("Y-translation raw: {}".format(yRaw))
-        self.textPrint.disp("Rotation raw: {}".format(rRaw))
-        self.textPrint.disp("Arm raw: {}".format(armRaw))
+        self.textPrint.disp("Y-translation raw: {:.3f}".format(float(yRaw)))
+        self.textPrint.disp("Rotation raw: {:.3f}".format(float(rRaw)))
+        self.textPrint.disp("Arm Trigger Shift: {:.3f}".format(float(armTrigs)))
         self.textPrint.unindent()
         self.textPrint.disp("")  # Intentional blank line
 
-        self.textPrint.disp("Motor Commands (0 <-> 254, 127 is neutral)")
+        self.textPrint.disp("CRSF Commands (172-1811, 992 is neutral)")
         self.textPrint.indent()
-        self.textPrint.disp("Left drive motor: {}".format(lMtrCmd))
-        self.textPrint.disp("Right drive motor: {}".format(rMtrCmd))
-        self.textPrint.disp("Arm motor: {}".format(armCmd))
+        self.textPrint.disp("CH1 (Left Drive): {}".format(int(ch1)))
+        self.textPrint.disp("CH2 (Right Drive): {}".format(int(ch2)))
+        self.textPrint.disp("CH3 (Weapon Drum): {}".format(int(ch3)))
+        self.textPrint.disp("CH4 (Arm Servo): {:.1f}".format(float(armTargetPos)))
+        self.textPrint.unindent()
+        self.textPrint.disp("")
+        self.textPrint.disp("Packets Sent: {}".format(packetsSent))
 
         pygame.display.flip()
 
@@ -136,13 +180,17 @@ def main():
         print("Joystick numaxes: ", joysticks[i].get_numaxes())
 
     # Local variables
-    prevDriveMtrCmds = {'left':0, 'right':0}
-    prevArmCmd = 127
+    prevChannels = [992] * 16
     prevTimeSent = 0
     done = False
     packetsSent = 0
     armDualAnalogUpTriggerInitialized = False
     armDualAnalogDownTriggerInitialized = False
+
+    # Atlas specific tracking state
+    armTargetPos = 992.0 # Neutral CRSF pos for arm
+    weaponOn = False
+    prevWeaponBtn = False
 
     try:
         while (done == False):
@@ -153,25 +201,36 @@ def main():
                 sendNeutralCommand()
                 continue
 
-            ##### WHEEL COMMANDS #####
+            ##### WHEEL COMMANDS (CH1, CH2) #####
 
             # Get the raw values for drive translation/rotation using the gamepad.
             yRaw = -joysticks[0].get_axis(AXIS_ID_DRIVE_VELOCITY)
             rRaw = joysticks[0].get_axis(AXIS_ID_DRIVE_ROTATION)
 
-            # Get the drive motor commands for Arcade Drive
+            # Get the drive motor commands for Arcade Drive (which scales to 172-1811)
             driveMtrCmds = arcadeDrive(yRaw, rRaw)
 
             ##########################
 
-            ###### ARM COMMAND #######
+            ###### WEAPON DRUM (CH3) ######
+            weaponBtn = joysticks[0].get_button(BUTTON_ID_WEAPON_TOGGLE)
+            if weaponBtn and not prevWeaponBtn:
+                weaponOn = not weaponOn
+            prevWeaponBtn = weaponBtn
+            
+            weaponCmd = 1811 if weaponOn else 172
 
-            # Get the raw values for the arm using the gamepad
-            armRaw = 0
+            ##########################
+
+            ###### ARM SERVO COMMAND (CH4) #######
+
+            # Get the raw values for the arm using the gamepad triggers
+            armTrigs = 0
             if (ARM_USE_DUAL_ANALOG_INPUT):
                 if (armDualAnalogUpTriggerInitialized and \
                     armDualAnalogDownTriggerInitialized):
-                    armRaw = -getArmRawFromDualAnalog( \
+                    # Positive output means "move up"
+                    armTrigs = getArmRawFromDualAnalog( \
                         joysticks[0].get_axis(AXIS_ID_ARM_UP), \
                         joysticks[0].get_axis(AXIS_ID_ARM_DOWN))
                 else:
@@ -180,38 +239,40 @@ def main():
                     if (joysticks[0].get_axis(AXIS_ID_ARM_DOWN) != 0):
                         armDualAnalogDownTriggerInitialized = True
             else:
-                armRaw = joysticks[0].get_axis(AXIS_ID_ARM)
+                armTrigs = -joysticks[0].get_axis(AXIS_ID_ARM) # Invert if single axis
 
-            # NOTE: Choose linear or exponential drive by changing between
-            #       `manualArmLinDrive()` and `manualArmExpDrive()`
-            armCmd = 254 - manualArmExpDrive( \
-                -armRaw, joysticks[0].get_button(BUTTON_ID_ARM_TURBO), \
-                joysticks[0].get_button(BUTTON_ID_ARM_DOWN_SLOW), \
-                joysticks[0].get_button(BUTTON_ID_ARM_UP_SLOW))
+            # Compute dynamic target position (shift position based on trigger pull)
+            max_speed = 10.0  # Max CRSF units per loop natively controls slew speed
+            deadband = 0.05
+            if abs(armTrigs) > deadband:
+                armTargetPos += armTrigs * max_speed
+                armTargetPos = max(172.0, min(1811.0, armTargetPos))
 
             ##########################
 
             if joysticks[0].get_button(BUTTON_ID_STOP_PROGRAM):
                 cleanup()
                 done = True
-             # Only send if the commands changed or if 50ms have elapsed
-            elif prevDriveMtrCmds['left'] != driveMtrCmds['left'] or \
-                 prevDriveMtrCmds['right'] != driveMtrCmds['right'] or \
-                 prevArmCmd != armCmd or \
-                 time.time()*1000 > prevTimeSent + 50:
+                
+            # Populate our 16 channels for CRSF
+            channels = [992] * 16
+            channels[0] = int(driveMtrCmds['left'])
+            channels[1] = int(driveMtrCmds['right'])
+            channels[2] = weaponCmd
+            channels[3] = int(armTargetPos)
+            
+            # Send at least every 20ms (50Hz packet rate minimum) or if channels changed
+            if channels != prevChannels or time.time()*1000 > prevTimeSent + 20:
 
-                ser.write((255).to_bytes(1, byteorder='big'))  # Start byte
-                ser.write((driveMtrCmds['left']).to_bytes(1, byteorder='big'))
-                ser.write((driveMtrCmds['right']).to_bytes(1, byteorder='big'))
-                ser.write((254-armCmd).to_bytes(1, byteorder='big'))
+                frame = build_crsf_frame(channels)
+                ser.write(frame)
 
-                prevDriveMtrCmds = driveMtrCmds
-                prevArmCmd = armCmd
+                prevChannels = channels.copy()
                 prevTimeSent = time.time()*1000
 
                 packetsSent = packetsSent + 1
-                screen.updateDisplay(yRaw, rRaw, armRaw, driveMtrCmds['left'], \
-                                     driveMtrCmds['right'], armCmd, packetsSent)
+                screen.updateDisplay(yRaw, rRaw, armTrigs, channels[0], \
+                                     channels[1], channels[2], armTargetPos, packetsSent)
 
                 time.sleep(0.01)
 
@@ -227,18 +288,18 @@ def main():
 ################################################################################
 def arcadeDrive(yIn, rIn):
     
-    # Set output command range constants
-    zeroCommand = int(127)  # the default value that corresponds to no motor power
-    cmdRange = int(127)     # the maximum amount (+/-) that the command can vary from the zero command
+    # Set output command range constants for CRSF
+    zeroCommand = int(992)  # the neutral 1500us equivalent
+    cmdRange = int(819)     # max variance from the zero command (992 -> 172 or 1811)
     maxCommand = cmdRange
     minCommand = -cmdRange
 
     # Set constants for the exponential functions for each input (y/r)
-    yExpConst = 1.5  # exponential growth coefficient of the Y-axis translation -- should be between 1.0-4.0
-    yEndpoint = 127  # maximum/minumum (+/-) for the Y-axis translation
+    yExpConst = 1.5   # exponential growth coefficient of the Y-axis translation -- should be between 1.0-4.0
+    yEndpoint = 819   # maximum/minumum (+/-) for the Y-axis translation
 
     rExpConst = 2.75  # exponential growth coefficient of the rotation -- should be between 1.0-4.0
-    rEndpoint = 90   # maximum/minimum (+/-) for the rotation
+    rEndpoint = 500   # maximum/minimum (+/-) for the rotation
 
     endExpConst = 1.44 # don't change this unless you've really looked over the math
 
@@ -251,8 +312,8 @@ def arcadeDrive(yIn, rIn):
     revTurningCorrection = 0
 
     # Set a base command (within the command range above) to overcome gearbox resistance at low drive speeds
-    leftMtrBaseCmd = int(10)
-    rightMtrBaseCmd = int(10)
+    leftMtrBaseCmd = int(40)
+    rightMtrBaseCmd = int(40)
 
     # Save the negative-ness, which will be re-applied after the exponential function is applied
     if yIn < 0:
@@ -334,6 +395,10 @@ def arcadeDrive(yIn, rIn):
     leftMtrCmdFinal = int(leftdriveMtrCmdScaled + zeroCommand)
     rightMtrCmdFinal = int(rightdriveMtrCmdScaled + zeroCommand)
 
+    # Clamp safely inside CRSF range as double check
+    leftMtrCmdFinal = max(172, min(1811, leftMtrCmdFinal))
+    rightMtrCmdFinal = max(172, min(1811, rightMtrCmdFinal))
+
     return {'left':leftMtrCmdFinal, 'right':rightMtrCmdFinal}
 
 
@@ -352,106 +417,6 @@ def getArmRawFromDualAnalog(aUp, aDown):
         aOut = -interp(aDown, [-1, 1], [0, 1])
     return aOut
 
-
-############################################################
-## @brief  Function to compute the manual arm drive command
-##         following a linear control curve
-## @param  aIn - raw input from -1.0 to 1.0
-## @return the arm command (0 to 254)
-############################################################
-def manualArmLinDrive(aIn):
-    deadband = 0.01
-    if (-deadband < aIn and aIn < deadband):
-        aIn = 0.0
-
-    return int(interp(aIn, [-1, 1], [0, 254]))
-
-
-############################################################
-## @brief  Function to compute the manual arm drive command
-##         following an exponential control curve
-## @param  aIn - raw input from -1.0 to 1.0, where 1.0 is "up" and -1.0 is "down"
-## @param  armTurbo - button which when held, gives more power to the arm
-## @param  armDownSlowBtn - button which slowly drives the arm down
-## @param  armUpSlowBtn - button which slowly drives the arm up
-## @return the arm command (0 to 254), where 0 is "max down" and 254 is "max up"
-############################################################
-def manualArmExpDrive(aIn, armTurbo, armDownSlowBtn, armUpSlowBtn):
-
-    # Set output command range constants
-    zeroCommand = int(127)  # the default value that corresponds to no motor power
-    cmdRange = int(127)     # the maximum amount (+/-) that the command can vary from the zero command
-    maxCommand = cmdRange
-    minCommand = -cmdRange
-
-    # Set constants for the exponential function
-    # See a plot at https://www.wolframalpha.com/input?i=plot+e%5E%28%28x%5E3.0%29%2F1.44%29-1+for+x+%3D+0+to+x+%3D+1
-    endExpConst = 1.44 # don't change this unless you've really looked over the math
-    expConst = 3.0  # exponential growth coefficient -- should be between 1.0-4.0
-    downEndpoint = 95  # maximum absolute value for the arm motor command in forward
-    upEndpoint = 127  # maximum absolute value for the arm motor command in reverse
-    nonTurboMultiplier = 0.8  # multiplier applied when *not* in turbo mode
-    armDownSlowCmd = 15  # absolute value for the arm motor in "slow" mode
-    armUpSlowCmd = 25  # absolute value for the arm motor in "slow" mode
-
-    # Set a deadband for the raw joystick input
-    deadband = 0.0
-
-    # Set a base command (within the command range above) to overcome gearbox resistance at low drive speeds
-    baseCmd = int(6)
-
-    # Apply the deadband
-    if abs(aIn) < deadband:
-        aIn = 0
-
-    # Save the negative-ness, which will be re-applied after the exponential function is applied
-    if aIn < 0 or armDownSlowBtn:
-        neg = -1
-        endpoint = downEndpoint
-    else:
-        neg = 1
-        endpoint = upEndpoint
-    
-    # Compute the motor command using the exponential function (zero-based)
-    aCmd = \
-      int( \
-        ( \
-          math.pow( \
-            math.e, \
-            math.pow(math.fabs(aIn), expConst) / endExpConst \
-          ) \
-          - 1 \
-        ) \
-        * (endpoint - baseCmd) \
-      )
-
-    # Add in the base command if the arm command is non-zero
-    if aCmd > 0:
-      aCmd = aCmd + baseCmd
-
-    # If the arm is not in turbo, then scale down the power
-    if not armTurbo:
-        aCmd = int(aCmd * nonTurboMultiplier)
-
-    # The buttons override what was computed via the analog input
-    if armDownSlowBtn:
-        aCmd = armDownSlowCmd
-    if armUpSlowBtn:
-        aCmd = armUpSlowCmd
-
-    # Re-apply the negative-ness
-    aCmd = neg * aCmd
-
-    # If the command is greater than the maximum or less than the minimum, scale it back
-    if aCmd > maxCommand:
-        aCmd = maxCommand
-    elif aCmd < minCommand:
-        aCmd = minCommand
-
-    # Shift the command to be based on the zeroCommand (above)
-    aCmd = aCmd + zeroCommand
-
-    return aCmd
 
 ############################################################
 ## @brief Run a watchdog check on the joystick
@@ -496,15 +461,11 @@ def joystickWatchdog(joystick):
 ## @brief Zero all the commands to the robot
 ############################################################
 def sendNeutralCommand():
-
     global ser
-
-    for i in range (0, 3):
-        ser.write((255).to_bytes(1, byteorder='big'))
-        ser.write((127).to_bytes(1, byteorder='big'))
-        ser.write((127).to_bytes(1, byteorder='big'))
-        ser.write((127).to_bytes(1, byteorder='big'))
-
+    channels = [992] * 16
+    channels[2] = 172 # keep weapon off!
+    frame = build_crsf_frame(channels)
+    ser.write(frame)
 
 ############################################################
 ## @brief Zero all the commands to the robot and exit
@@ -519,6 +480,60 @@ def cleanup():
     pygame.quit()
     exit()
 
+############################################################
+## CRSF Protocol specific functions 
+############################################################
+def crc8_dvb_s2(data):
+    """Calculates CRC-8 using polynomial 0xD5."""
+    crc = 0x00
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x80:
+                crc = (crc << 1) ^ 0xD5
+            else:
+                crc <<= 1
+            crc &= 0xFF
+    return crc
+
+def pack_rc_channels(channels):
+    """
+    Packs 16 channels (each 11 bits) into a 22-byte array.
+    'channels' should be a list of 16 integers.
+    """
+    payload = bytearray(22)
+    bits = 0
+    bit_count = 0
+    byte_index = 0
+    
+    for ch in channels:
+        # Clamp channel to 11 bits (0-2047)
+        bits |= (ch & 0x7FF) << bit_count
+        bit_count += 11
+        
+        while bit_count >= 8:
+            payload[byte_index] = bits & 0xFF
+            bits >>= 8
+            bit_count -= 8
+            byte_index += 1
+            
+    return bytes(payload)
+
+def build_crsf_frame(channels):
+    """Builds the full CRSF frame for RC_CHANNELS_PACKED transmission."""
+    # Frame Type: 0x16 for RC_CHANNELS_PACKED
+    frame_type = 0x16
+    payload = pack_rc_channels(channels)
+    
+    # Calculate CRC over Type + Payload
+    crc_data = bytes([frame_type]) + payload
+    crc = crc8_dvb_s2(crc_data)
+    
+    # Construct complete frame: [Address] [Length] [Type] [Payload] [CRC]
+    # Length = Payload Size (22) + 2 (Type + CRC) = 24
+    # Address 0xC8 is standard Flight Controller address to Transmitter
+    frame = bytes([0xC8, 24, frame_type]) + payload + bytes([crc])
+    return frame
 
 if __name__ == '__main__':
     sys.exit(int(main() or 0))
